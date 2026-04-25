@@ -165,10 +165,18 @@ export default function Home() {
 
             {/* Error */}
             {step === "error" && error && (
-              <div className="rounded-xl p-4 text-xs leading-relaxed"
-                   style={{ background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.25)", color: "#fca5a5" }}>
-                <strong className="block mb-1 text-red-400">⚠ Error</strong>
-                {error}
+              <div className="rounded-xl p-4 space-y-2"
+                   style={{ background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.25)" }}>
+                <strong className="block text-sm text-red-400">
+                  {error.includes("busy") || error.includes("rate limit") || error.includes("All models")
+                    ? "⏳ AI models are busy right now"
+                    : "⚠ Something went wrong"}
+                </strong>
+                <p className="text-xs text-red-300/70 leading-relaxed">
+                  {error.includes("busy") || error.includes("rate limit") || error.includes("All models")
+                    ? "Free-tier AI servers are under heavy load. Click ↺ Regenerate to try again — it usually works on the second attempt."
+                    : error}
+                </p>
               </div>
             )}
 
