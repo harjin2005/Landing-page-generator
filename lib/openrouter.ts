@@ -51,6 +51,7 @@ async function callOne(
       "X-Title": "Troopod Ad Personalizer",
     },
     body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature: 0.2 }),
+    signal: AbortSignal.timeout(28_000), // hard cap per model — prevents function timeout
   });
 
   if (res.status === 429) {

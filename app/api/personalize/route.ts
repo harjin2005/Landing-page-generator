@@ -14,42 +14,30 @@ interface AdInsights {
   target_audience: string;
 }
 
-/**
- * Google Images search result URLs contain the real image in the `imgurl` param.
- * Detect and unwrap them before doing anything else.
- */
 function extractRealImageUrl(raw: string): string {
   try {
     const u = new URL(raw);
-    // google.com/imgres?imgurl=...
     if (u.hostname.includes("google.") && u.pathname.includes("imgres")) {
       const imgurl = u.searchParams.get("imgurl");
       if (imgurl) return decodeURIComponent(imgurl);
     }
-    // google.com/search?q=...&tbm=isch — not a direct image
     if (u.hostname.includes("google.") && u.searchParams.get("tbm") === "isch") {
       throw new Error(
         "That is a Google Images search page, not a direct image URL. " +
-          "Right-click an image on Google → 'Copy image address' and paste that instead."
+          "Right-click an image → 'Copy image address' and paste that instead."
       );
     }
   } catch (e) {
     if (e instanceof Error && e.message.startsWith("That is")) throw e;
-    // URL parse failed — return as-is
   }
   return raw;
 }
 
-/**
- * Try to convert a remote image URL to base64 data URL.
- * Returns null if the image cannot be fetched (blocked, 404, etc.)
- */
 async function tryFetchBase64(url: string): Promise<string | null> {
   const origin = new URL(url).origin;
   const attempts: Record<string, string>[] = [
     {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
       Accept: "image/webp,image/apng,image/*,*/*;q=0.8",
       Referer: origin,
     },
@@ -60,7 +48,7 @@ async function tryFetchBase64(url: string): Promise<string | null> {
     try {
       const res = await fetch(url, {
         headers,
-        signal: AbortSignal.timeout(8_000),
+        signal: AbortSignal.timeout(4_000), // reduced: 4s per attempt (was 8s)
         redirect: "follow",
       });
       if (!res.ok) continue;
@@ -75,62 +63,57 @@ async function tryFetchBase64(url: string): Promise<string | null> {
   return null;
 }
 
+function buildVisionMessages(imageSource: string) {
+  return [
+    {
+      role: "system" as const,
+      content: 'You are an ad analyst. Return ONLY valid JSON: {"headline":"","value_prop":"","offer":"","cta":"","tone":"","target_audience":""}',
+    },
+    {
+      role: "user" as const,
+      content: [
+        { type: "image_url" as const, image_url: { url: imageSource } },
+        { type: "text" as const, text: "Analyze this ad. Return JSON only." },
+      ],
+    },
+  ];
+}
+
 export async function POST(req: NextRequest) {
   try {
     const { adUrl: rawAdUrl, adBase64, pageUrl } = await req.json();
-    // Unwrap Google Images search URLs → extract the real image URL
     const adUrl: string | undefined = rawAdUrl ? extractRealImageUrl(rawAdUrl) : undefined;
 
     if (!pageUrl) return NextResponse.json({ error: "pageUrl is required" }, { status: 400 });
     if (!adUrl && !adBase64)
       return NextResponse.json({ error: "Ad creative (URL or upload) is required" }, { status: 400 });
 
-    // ── Step 1: Scrape the landing page ──────────────────────────────────
-    const pageData = await scrapePage(pageUrl);
-
-    // ── Step 2: Resolve image source ─────────────────────────────────────
-    // Priority: uploaded base64 → server-fetched base64 → raw URL (Gemma only)
-    let imageSource: string;
-    let imageIsUrl = false;
+    let adRaw: string;
+    let pageData: Awaited<ReturnType<typeof scrapePage>>;
 
     if (adBase64) {
-      imageSource = adBase64;
+      // ── Fast path: base64 already available → scrape + vision in parallel ──
+      [pageData, adRaw] = await Promise.all([
+        scrapePage(pageUrl),
+        callModel(MODELS.vision, buildVisionMessages(adBase64), 400, false),
+      ]);
     } else {
-      // adUrl is guaranteed non-empty here (validated above)
+      // ── URL path: resolve image, then scrape + vision in parallel ──────────
       const url = adUrl as string;
-      const base64 = await tryFetchBase64(url);
-      if (base64) {
-        imageSource = base64;
-      } else {
-        imageSource = url;
-        imageIsUrl = true;
-      }
-    }
+      const [base64, scrapeResult] = await Promise.all([
+        tryFetchBase64(url),
+        scrapePage(pageUrl),
+      ]);
+      pageData = scrapeResult;
 
-    // ── Step 3: Analyze ad creative (vision model) ───────────────────────
-    const adRaw = await callModel(
-      MODELS.vision,
-      [
-        {
-          role: "system",
-          content:
-            'You are an ad analyst. Analyze the ad image and return ONLY valid JSON: {"headline":"","value_prop":"","offer":"","cta":"","tone":"","target_audience":""}',
-        },
-        {
-          role: "user",
-          content: [
-            { type: "image_url", image_url: { url: imageSource } },
-            { type: "text", text: "Extract the ad elements. Return JSON only." },
-          ],
-        },
-      ],
-      800,
-      imageIsUrl // tells callModel to skip base64-only models (NVIDIA)
-    );
+      const imageSource = base64 ?? url;
+      const imageIsUrl = !base64;
+      adRaw = await callModel(MODELS.vision, buildVisionMessages(imageSource), 400, imageIsUrl);
+    }
 
     const adInsights = extractJSON<AdInsights>(adRaw);
 
-    // ── Step 4: Generate personalized page copy (text model) ─────────────
+    // ── Text rewrite (needs both scrape + vision results) ────────────────────
     const pageContext = [
       `title: "${pageData.title}"`,
       `h1: "${pageData.h1}"`,
@@ -169,8 +152,6 @@ Rules:
     );
 
     const changes = extractJSON<Changes>(changesRaw);
-
-    // ── Step 5: Inject changes into the page HTML ─────────────────────────
     const modifiedHtml = injectChanges(pageData.html, changes);
 
     return NextResponse.json({
