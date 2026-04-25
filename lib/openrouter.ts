@@ -1,19 +1,20 @@
 const BASE = "https://openrouter.ai/api/v1";
 
 export const MODELS = {
-  // All free vision models — widest net to beat rate limits
+  // Smallest/fastest models first — free tier queues large models heavily
   // Gemma accept URLs + base64; NVIDIA base64 only (last resort)
   vision: [
-    process.env.VISION_MODEL ?? "google/gemma-3-27b-it:free",
-    "google/gemma-4-31b-it:free",
-    "google/gemma-4-26b-a4b-it:free",
-    "google/gemma-3-4b-it:free",
-    "nvidia/nemotron-nano-12b-v2-vl:free", // base64 only — always last
+    process.env.VISION_MODEL ?? "google/gemma-3-4b-it:free",       // 4B — fastest
+    "meta-llama/llama-3.2-11b-vision-instruct:free",                // 11B — fast
+    "google/gemma-3-27b-it:free",                                   // 27B — fallback
+    "google/gemma-4-26b-a4b-it:free",                              // 26B MoE — fallback
+    "nvidia/nemotron-nano-12b-v2-vl:free",                         // base64 only — last
   ],
   text: [
-    process.env.TEXT_MODEL ?? "tencent/hy3-preview:free",
+    process.env.TEXT_MODEL ?? "openai/gpt-oss-20b:free",           // 20B — fastest
+    "meta-llama/llama-3.1-8b-instruct:free",                       // 8B — very fast
+    "tencent/hy3-preview:free",
     "openai/gpt-oss-120b:free",
-    "openai/gpt-oss-20b:free",
     "google/gemma-4-31b-it:free",
   ],
 };
@@ -51,7 +52,7 @@ async function callOne(
       "X-Title": "Troopod Ad Personalizer",
     },
     body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature: 0.2 }),
-    signal: AbortSignal.timeout(28_000), // hard cap per model — prevents function timeout
+    signal: AbortSignal.timeout(18_000), // 18s cap — leaves room for fallbacks within 60s limit
   });
 
   if (res.status === 429) {
