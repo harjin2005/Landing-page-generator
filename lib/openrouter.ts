@@ -1,16 +1,16 @@
 const BASE = "https://openrouter.ai/api/v1";
 
 export const MODELS = {
-  // Confirmed free vision models on OpenRouter — smallest/fastest first
+  // Confirmed free vision models on OpenRouter — all raced concurrently
   vision: [
-    process.env.VISION_MODEL ?? "qwen/qwen-2.5-vl-7b-instruct:free", // 7B — fastest
-    "mistralai/pixtral-12b:free",                                      // 12B
-    "google/gemma-3-27b-it:free",                                      // 27B
-    "google/gemma-4-31b-it:free",                                      // 31B
-    "google/gemma-4-26b-a4b-it:free",                                  // 26B MoE
+    process.env.VISION_MODEL ?? "qwen/qwen-2.5-vl-7b-instruct:free",
+    "mistralai/pixtral-12b:free",
+    "google/gemma-3-27b-it:free",
+    "google/gemma-4-31b-it:free",
+    "google/gemma-4-26b-a4b-it:free",
   ],
   text: [
-    process.env.TEXT_MODEL ?? "meta-llama/llama-3.1-8b-instruct:free", // 8B — fastest
+    process.env.TEXT_MODEL ?? "meta-llama/llama-3.1-8b-instruct:free",
     "openai/gpt-oss-20b:free",
     "tencent/hy3-preview:free",
     "openai/gpt-oss-120b:free",
@@ -33,8 +33,7 @@ async function sleep(ms: number) {
 async function callOne(
   model: string,
   messages: Message[],
-  maxTokens: number,
-  imageIsUrl: boolean
+  maxTokens: number
 ): Promise<string | null> {
   const res = await fetch(`${BASE}/chat/completions`, {
     method: "POST",
@@ -48,25 +47,15 @@ async function callOne(
     signal: AbortSignal.timeout(18_000),
   });
 
-  // Treat rate limits and temporary errors as "skip to next model"
-  if (res.status === 429 || res.status === 502 || res.status === 503) {
-    await sleep(300);
-    return null;
-  }
-
-  if (!res.ok) {
-    const body = await res.text();
-    // 400/404 = model config issue — skip silently
-    if (res.status === 400 || res.status === 404) return null;
-    throw new Error(`OpenRouter ${res.status}: ${body.slice(0, 200)}`);
-  }
+  if (res.status === 429 || res.status === 502 || res.status === 503) return null;
+  if (res.status === 400 || res.status === 404) return null; // bad model config — skip silently
+  if (!res.ok) return null; // any other error — skip
 
   const data = await res.json();
   const msg = data.choices?.[0]?.message;
-
   if (msg?.content) return msg.content as string;
 
-  // Reasoning models: extract JSON block from reasoning trace
+  // Reasoning models: pull JSON from reasoning trace
   if (msg?.reasoning) {
     const jsonBlock = (msg.reasoning as string).match(/\{[\s\S]+?\}/);
     if (jsonBlock) return jsonBlock[0];
@@ -75,58 +64,73 @@ async function callOne(
   return null;
 }
 
-/** Try all models in order; if all fail, pause 3s and try the top 2 once more. */
+/**
+ * Race all models simultaneously — return the first non-null response.
+ * Much faster than sequential: winner is whichever model responds first,
+ * and diverse providers have separate rate-limit buckets.
+ */
+async function raceModels(
+  models: string[],
+  messages: Message[],
+  maxTokens: number
+): Promise<string | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let remaining = models.length;
+
+    if (remaining === 0) { resolve(null); return; }
+
+    models.forEach((model) => {
+      callOne(model, messages, maxTokens)
+        .then((result) => {
+          remaining--;
+          if (!settled && result) {
+            settled = true;
+            resolve(result);
+          } else if (remaining === 0 && !settled) {
+            resolve(null);
+          }
+        })
+        .catch(() => {
+          remaining--;
+          if (remaining === 0 && !settled) resolve(null);
+        });
+    });
+  });
+}
+
+/**
+ * Race all models; if all fail, wait 4s and race once more.
+ * With 5 diverse providers two rounds = 10 chances — nearly impossible to exhaust.
+ */
 export async function callModel(
   models: string[],
   messages: Message[],
   maxTokens = 400,
-  imageIsUrl = false
+  _imageIsUrl = false // kept for API compat, no longer needed
 ): Promise<string> {
-  // First pass — try every model
-  for (const model of models) {
-    try {
-      const result = await callOne(model, messages, maxTokens, imageIsUrl);
-      if (result) return result;
-    } catch {
-      // continue
-    }
-  }
+  const first = await raceModels(models, messages, maxTokens);
+  if (first) return first;
 
-  // Second pass — models may have just been momentarily busy; wait and retry top 2
-  await sleep(3_000);
-  for (const model of models.slice(0, 2)) {
-    try {
-      const result = await callOne(model, messages, maxTokens, imageIsUrl);
-      if (result) return result;
-    } catch {
-      // continue
-    }
-  }
+  // All 5 failed — brief pause then one more race
+  await sleep(4_000);
+  const second = await raceModels(models, messages, maxTokens);
+  if (second) return second;
 
   throw new Error(
-    "AI models are currently busy (free tier rate limits). Please wait a few seconds and try again."
+    "AI models are currently busy (free tier rate limits). Please wait a moment and click Regenerate."
   );
 }
 
 /** Extract JSON from a model response that may include markdown fences. */
 export function extractJSON<T = Record<string, string>>(text: string): T {
-  try {
-    return JSON.parse(text) as T;
-  } catch {}
+  try { return JSON.parse(text) as T; } catch {}
 
   const fenced = text.match(/```(?:json)?\s*([\s\S]+?)\s*```/);
-  if (fenced) {
-    try {
-      return JSON.parse(fenced[1]) as T;
-    } catch {}
-  }
+  if (fenced) { try { return JSON.parse(fenced[1]) as T; } catch {} }
 
   const block = text.match(/\{[\s\S]+\}/);
-  if (block) {
-    try {
-      return JSON.parse(block[0]) as T;
-    } catch {}
-  }
+  if (block) { try { return JSON.parse(block[0]) as T; } catch {} }
 
-  throw new Error(`Could not parse model output. Please try again.`);
+  throw new Error("Could not parse model output. Please try again.");
 }
